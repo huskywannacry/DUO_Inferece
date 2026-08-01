@@ -25,7 +25,7 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 
-from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler, DDIMScheduler
 from PIL import Image
 
 
@@ -90,6 +90,19 @@ def parse_args():
         type=str,
         default="cuda",
     )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=50,
+        help="Number of inference steps. Use 10-20 for speed, 50 for quality.",
+    )
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="ddim",
+        choices=["ddim", "dpm"],
+        help="Scheduler: ddim (fast) or dpm (high quality, slower). Default=ddim for speed.",
+    )
     return parser.parse_args()
 
 
@@ -101,8 +114,11 @@ def load_model(args):
         args.pretrained_model_name_or_path, torch_dtype=weight_dtype
     ).to(device)
 
-    # Use DPMSolver for faster inference (same as paper's validation)
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    # Use faster scheduler: DDIM with trailing spacing gives good quality at 10-20 steps
+    pipe.scheduler = DDIMScheduler.from_config(
+        pipe.scheduler.config,
+        timestep_spacing="trailing",
+    )
 
     if args.model_type == "unlearn":
         if args.exp_type == "violence":

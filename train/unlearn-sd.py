@@ -610,8 +610,11 @@ def main(args):
                 "Make sure to install wandb if you want to use it for logging during training."
             )
         import wandb
-
-        wandb.login(key="enter_your_wandb_key")
+        try:
+            wandb.login(key="enter_your_wandb_key")
+        except:
+            print("wandb login failed, continuing without wandb")
+            args.report_to = "tensorboard"
         if args.dcoloss_beta > 0:
             exp_name = f"SD-{args.config_name}-{args.method}-beta_{args.dcoloss_beta}-lambda_{args.base_lambda}-lr_{args.base_lr}-lora_rank_{args.rank}-bs_{args.train_batch_size}-num_samples_{args.num_samples}"
             if not args.given_prompt:
@@ -631,19 +634,22 @@ def main(args):
         elif args.dcoloss_beta == 0:
             exp_name = f"{args.config_name}-naive_unlearning"
 
-        if accelerator.is_main_process:
-            wandb.init(
-                project=args.project,
-                name=exp_name,
-                # Track hyperparameters and run metadata
-                config={
-                    "group": args.group,
-                    "config_name": args.config_name,
-                    "method": args.method,
-                    "base_lambda": args.base_lambda,
-                    "dcoloss_beta": args.dcoloss_beta,
-                },
-            )
+        if accelerator.is_main_process and args.report_to == "wandb":
+            try:
+                wandb.init(
+                    project=args.project,
+                    name=exp_name,
+                    config={
+                        "group": args.group,
+                        "config_name": args.config_name,
+                        "method": args.method,
+                        "base_lambda": args.base_lambda,
+                        "dcoloss_beta": args.dcoloss_beta,
+                    },
+                )
+            except:
+                print("wandb.init failed, continuing without wandb")
+                args.report_to = "tensorboard"
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -996,14 +1002,18 @@ def main(args):
 
                 for tracker in accelerator.trackers:
                     if tracker.name == "wandb":
-                        tracker.log(
-                            {
-                                f"{title}": [
-                                    wandb.Image(image, caption=f"{i}: {prompt}")
-                                    for i, image in enumerate(images)
-                                ]
-                            }
-                        )
+                        try:
+                            import wandb
+                            tracker.log(
+                                {
+                                    f"{title}": [
+                                        wandb.Image(image, caption=f"{i}: {prompt}")
+                                        for i, image in enumerate(images)
+                                    ]
+                                }
+                            )
+                        except:
+                            pass
 
         del pipeline
         torch.cuda.empty_cache()
