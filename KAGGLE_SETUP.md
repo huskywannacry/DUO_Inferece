@@ -3,11 +3,10 @@
 Tái hiện toàn bộ kết quả **nudity** của paper DUO trên Kaggle free (1 GPU, 12h).
 
 **Bao gồm:**
-- ✅ Train Nudity β=500
-- ✅ Train Nudity β=250
-- ✅ FID + CLIP Score (COCO 30k)
-- ✅ Ring-A-Bell defense + DSR (NudeNet)
-- ✅ Concept Inversion defense + DSR (NudeNet)
+- ✅ Train Nudity β=500 (metric chính paper)
+- ✅ FID + CLIP Score (COCO 30k, cả baseline SD1.4)
+- ✅ Ring-A-Bell attack + DSR (NudeNet)
+- ✅ Concept Inversion attack + DSR (NudeNet)
 
 **Không bao gồm** (vì cần OpenAI API key):
 - ❌ Violence experiments
@@ -31,8 +30,7 @@ git push -u origin main
    - **Accelerator**: GPU T4
    - **Persistent storage**: ON
    - **Internet**: ON
-3. Add Data → search "coco-2014" → add **"coco-2014-validation"**
-4. Cell đầu tiên:
+3. Cell đầu tiên:
 
 ```python
 !git clone git@github.com:huskywannacry/DUO_Inferece.git
@@ -52,12 +50,29 @@ git push -u origin main
 
 ---
 
-## Bước 4: Download COCO annotations
+## Bước 4: Download COCO 2014 validation images + annotations
+
+Paper dùng MS COCO 2014 validation (30k captions cho FID/CLIP).
 
 ```python
+# Download COCO 2014 validation images (~6GB, ~10 phút)
+!wget -q http://images.cocodataset.org/zips/val2014.zip -O /tmp/val2014.zip
+!unzip -q /tmp/val2014.zip -d /kaggle/working/coco_val_30k/
+!rm /tmp/val2014.zip
+
+# Download COCO annotations (chứa captions)
 !wget -q http://images.cocodataset.org/annotations/annotations_trainval2014.zip -O /tmp/annot.zip
 !unzip -q /tmp/annot.zip -d /kaggle/working/coco_annotations/
+!rm /tmp/annot.zip
+
+# Kiểm tra
+!ls /kaggle/working/coco_val_30k/val2014/ | head -5
+!ls /kaggle/working/coco_annotations/annotations/captions_val2014.json
 ```
+
+Sau đó dùng các đường dẫn:
+- `COCO_DIR="/kaggle/working/coco_val_30k/val2014"`
+- `COCO_ANNOTATIONS="/kaggle/working/coco_annotations/annotations/captions_val2014.json"`
 
 ---
 
@@ -65,8 +80,8 @@ git push -u origin main
 
 ```python
 %cd /kaggle/working
-!git clone https://github.com/abyildirim/Ring-A-Bell.git
-!git clone https://github.com/ml-research/I2P.git
+!git clone https://github.com/chiayi-hsu/Ring-A-Bell.git
+!git clone https://github.com/ml-research/i2p.git
 %cd /kaggle/working/DUO_Inferece
 ```
 
@@ -139,76 +154,7 @@ Paper khuyến nghị β=500 cho black-box attacks (Ring-A-Bell). Kết quả mo
 
 > ⏱ ~1h.
 
-### Nudity β=250
 
-Paper khuyến nghị β=250 cho white-box attacks (Concept Inversion). Kết quả mong đợi: FID ~13.59, CLIP ~30.84, DSR ~90%.
-
-```python
-%cd /kaggle/working/DUO_Inferece
-!mkdir -p outputs/unlearn/SD-train/dpo/250/Nudity
-!python3 train/unlearn-sd.py \
-    --config_dir="/kaggle/working/DUO_Inferece/datasets/SD/config.json" \
-    --config_name="Nudity" \
-    --data_dir="/kaggle/working/DUO_Inferece/datasets/SD" \
-    --output_dir="/kaggle/working/DUO_Inferece/outputs/unlearn/SD-train/dpo/250/Nudity" \
-    --target_prompt="a naked woman" \
-    --synonym_prompt="a naked man" \
-    --prior_prompt="a man" \
-    --base_lr=3e-4 \
-    --adam_weight_decay=1e-2 \
-    --dcoloss_beta=250 \
-    --base_lambda=1e6 \
-    --rank=32 \
-    --method=dpo \
-    --train_batch_size=1 \
-    --max_train_steps=1000 \
-    --checkpointing_steps=500 \
-    --validation_steps=500 \
-    --num_validation_images=2 \
-    --num_samples=64 \
-    --t_max=750 \
-    --t_min=1 \
-    --dataloader_num_workers=0 \
-    --no_cross_attn \
-    --seed=42
-```
-
-> ⏱ ~1h.
-
-### (Optional) Các β khác cho Pareto curve
-
-Paper Fig.4 vẽ Pareto curve với β ∈ {100, 250, 500, 1000, 2000}. Nếu còn thời gian:
-
-```python
-for beta in 100 1000 2000; do
-    !mkdir -p outputs/unlearn/SD-train/dpo/$beta/Nudity
-    !python3 train/unlearn-sd.py \
-        --config_dir="/kaggle/working/DUO_Inferece/datasets/SD/config.json" \
-        --config_name="Nudity" \
-        --data_dir="/kaggle/working/DUO_Inferece/datasets/SD" \
-        --output_dir="/kaggle/working/DUO_Inferece/outputs/unlearn/SD-train/dpo/$beta/Nudity" \
-        --target_prompt="a naked woman" \
-        --synonym_prompt="a naked man" \
-        --prior_prompt="a man" \
-        --base_lr=3e-4 \
-        --adam_weight_decay=1e-2 \
-        --dcoloss_beta=$beta \
-        --base_lambda=1e6 \
-        --rank=32 \
-        --method=dpo \
-        --train_batch_size=1 \
-        --max_train_steps=1000 \
-        --checkpointing_steps=500 \
-        --validation_steps=500 \
-        --num_validation_images=2 \
-        --num_samples=64 \
-        --t_max=750 \
-        --t_min=1 \
-        --dataloader_num_workers=0 \
-        --no_cross_attn \
-        --seed=42
-done
-```
 
 ---
 
@@ -255,25 +201,6 @@ DDIM 10 steps cho chất lượng gần tương đương DPMSolver cho mục đ�
 
 > ⏱ ~2.5h. Kết quả mong đợi: FID ~13.65.
 
-### 8c. Unlearned Nudity β=250
-
-```python
-%cd /kaggle/working/DUO_Inferece
-
-!python3 -m evaluation.generate_coco \
-    --model_type unlearn \
-    --exp_type nudity \
-    --unlearn_model_path outputs/unlearn/SD-train/dpo/250/Nudity \
-    --output_dir eval_results/nudity_b250 \
-    --coco_annotations /kaggle/working/coco_annotations/annotations/captions_val2014.json \
-    --batch_size 8 \
-    --num_inference_steps 10 \
-    --num_prompts 30000 \
-    --seed 42 \
-    --device cuda
-```
-
-> ⏱ ~2.5h. Kết quả mong đợi: FID ~13.59.
 
 ---
 
@@ -283,7 +210,7 @@ DDIM 10 steps cho chất lượng gần tương đương DPMSolver cho mục đ�
 %cd /kaggle/working/DUO_Inferece
 
 # Xác định đường dẫn COCO thật
-COCO_DIR="/kaggle/input/coco-2014-validation/val2014"
+COCO_DIR="/kaggle/working/coco_val_30k/val2014"
 
 # FID - Original SD1.4 (kiểm tra baseline có khớp paper không)
 !python3 -m evaluation.compute_fid \
@@ -297,26 +224,19 @@ COCO_DIR="/kaggle/input/coco-2014-validation/val2014"
     --fake_dir eval_results/nudity_b500 \
     --device cuda
 
-# FID - Nudity β=250
-!python3 -m evaluation.compute_fid \
-    --real_dir $COCO_DIR \
-    --fake_dir eval_results/nudity_b250 \
-    --device cuda
 
 # CLIP Score
 !python3 -m evaluation.compute_clip_score \
     --image_dir eval_results/original_sd14 --device cuda
 !python3 -m evaluation.compute_clip_score \
     --image_dir eval_results/nudity_b500 --device cuda
-!python3 -m evaluation.compute_clip_score \
-    --image_dir eval_results/nudity_b250 --device cuda
 ```
 
 ---
 
 ## Bước 10: Ring-A-Bell Defense (Nudity)
 
-Paper dùng **95 pre-trained prompts** cho nudity từ Ring-A-Bell repo.  
+Paper dùng **95 pre-trained prompts** cho nudity từ Ring-A-Bell repo (`data/Prompts_For_ConceptVector/Nudity_prompt.csv`).  
 DSR tính bằng NudeNet detector (free, không cần API key).
 
 ```python
@@ -327,27 +247,16 @@ DSR tính bằng NudeNet detector (free, không cần API key).
     --unlearn_model_path outputs/unlearn/SD-train/dpo/500/Nudity \
     --exp_type nudity \
     --output_dir eval_results/ring_a_bell_nudity_b500 \
-    --ring_a_bell_prompts /kaggle/working/Ring-A-Bell/data/prompts/nudity.txt \
+    --ring_a_bell_prompts /kaggle/working/Ring-A-Bell/data/Prompts_For_ConceptVector/Nudity_prompt.csv \
     --device cuda
 
 !python3 -m evaluation.defense_success_rate \
     --task nudity \
     --image_dir eval_results/ring_a_bell_nudity_b500
 
-# β=250
-!python3 -m evaluation.ring_a_bell \
-    --unlearn_model_path outputs/unlearn/SD-train/dpo/250/Nudity \
-    --exp_type nudity \
-    --output_dir eval_results/ring_a_bell_nudity_b250 \
-    --ring_a_bell_prompts /kaggle/working/Ring-A-Bell/data/prompts/nudity.txt \
-    --device cuda
-
-!python3 -m evaluation.defense_success_rate \
-    --task nudity \
-    --image_dir eval_results/ring_a_bell_nudity_b250
 ```
 
-> Kết quả mong đợi: DSR ~90% cho β=500, ~85% cho β=250.
+> Kết quả mong đợi: DSR ~90% cho β=500.
 
 ---
 
@@ -362,16 +271,6 @@ Paper protocol cho Concept Inversion (Section 4.1):
 ```python
 %cd /kaggle/working/DUO_Inferece
 
-# Nudity β=250
-!python3 -m evaluation.concept_inversion \
-    --unlearn_model_path outputs/unlearn/SD-train/dpo/250/Nudity \
-    --exp_type nudity \
-    --output_dir eval_results/concept_inversion_nudity_b250 \
-    --device cuda
-
-!python3 -m evaluation.defense_success_rate \
-    --task nudity \
-    --image_dir eval_results/concept_inversion_nudity_b250
 
 # Nudity β=500
 !python3 -m evaluation.concept_inversion \
@@ -385,38 +284,35 @@ Paper protocol cho Concept Inversion (Section 4.1):
     --image_dir eval_results/concept_inversion_nudity_b500
 ```
 
-> Kết quả mong đợi: DSR ~90% cho β=250, ~85% cho β=500.
+> Kết quả mong đợi: DSR ~85% cho β=500 (Concept Inversion).
 
 ---
 
 ## 📊 So sánh với paper
 
-| Metric | Paper SD1.4 | Paper DUO β=500 | Paper DUO β=250 | Của bạn β=500 | Của bạn β=250 |
-|--------|-------------|-----------------|-----------------|---------------|---------------|
-| **FID** ↓ | 13.52 | 13.65 | 13.59 | | |
-| **CLIP Score** ↑ | 30.95 | ~30.88 | 30.84 | | |
-| **Prior Preserv (1-LPIPS)** ↑ | — | ~0.85 | ~0.82 | | |
-| **DSR Ring-A-Bell** ↑ | 0% | ~90% | ~85% | | |
-| **DSR Concept Inversion** ↑ | 0% | ~85% | ~90% | | |
+| Metric | Paper SD1.4 | Paper DUO β=500 | Của bạn β=500 |
+|--------|-------------|-----------------|---------------|
+| **FID** ↓ | 13.52 | 13.65 | |
+| **CLIP Score** ↑ | 30.95 | ~30.88 | |
+| **Prior Preserv (1-LPIPS)** ↑ | — | ~0.85 | |
+| **DSR Ring-A-Bell** ↑ | 0% | ~90% | |
+| **DSR Concept Inversion** ↑ | 0% | ~85% | |
 
 ---
 
 ## ⏱ Timeline 12h
 
 ```
-0h - 2h:     Gen dataset (Nudity 64 ảnh)
-2h - 3h:     Train Nudity β=500
-3h - 4h:     Train Nudity β=250
-4h - 5h:     Train các β khác (100, 1000, 2000) nếu muốn
-5h - 7h30:   COCO 30k original SD1.4 (DDIM 10 steps, bs=8)
-7h30 - 10h:  COCO 30k unlearned β=500
-10h - 11h:   FID + CLIP tính toán
-11h - 11h15: Ring-A-Bell (95 prompts) + DSR
-11h15 - 11h45: Concept Inversion + DSR
-11h45 - 12h: Save + download
+0h - 0h15: Cài đặt + clone + wget COCO
+0h15 - 1h30: Gen dataset Nudity 64 ảnh
+1h30 - 2h30: Train β=500
+2h30 - 5h:   COCO 30k original SD1.4 (verify baseline FID=13.52)
+5h - 7h30:  COCO 30k β=500 (FID=13.65)
+7h30 - 8h:  FID (original + β=500) + CLIP
+8h - 8h15:  Ring-A-Bell 95 prompts + DSR β=500
+8h15 - 10h45: Concept Inversion (3000 steps textual inversion) + DSR β=500
+10h45 - 12h: Save + dự phòng
 ```
-
-> Nếu gen 30k chậm hơn dự kiến, giảm `--num_prompts 15000` hoặc chỉ gen 1 model thay vì 2.
 
 ---
 
@@ -434,7 +330,7 @@ shutil.make_archive(
 )
 
 # Zip model weights
-for beta in ['500', '250']:
+for beta in ['500']:
     path = f'/kaggle/working/DUO_Inferece/outputs/unlearn/SD-train/dpo/{beta}'
     if os.path.exists(path):
         shutil.make_archive(
