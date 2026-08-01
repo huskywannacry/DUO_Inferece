@@ -4,6 +4,7 @@
 
 import argparse
 import gc
+import os
 
 import torch
 from diffusers import StableDiffusionPipeline
@@ -53,11 +54,15 @@ def load_sd_dpo(args):
     if args.exp_type == 'violence':
         config_list = ["Blood", "Gun", "Horror", "Suffer"]
         for config_name in config_list:
-            lora_path = f'{args.unlearn_model_path}/{config_name}/checkpoint-500/pytorch_lora_weights.safetensors'
+            lora_path = f'{args.unlearn_model_path}/{config_name}/pytorch_lora_weights.safetensors'
+            if not os.path.exists(lora_path):
+                lora_path = f'{args.unlearn_model_path}/{config_name}/checkpoint-500/pytorch_lora_weights.safetensors'
             pipe.load_lora_weights(lora_path, adapter_name=config_name)
         pipe.set_adapters(config_list, adapter_weights=[1, 1, 1, 1])
     else:
-        lora_path = f'{args.unlearn_model_path}/Nudity/pytorch_lora_weights.safetensors'
+        lora_path = f'{args.unlearn_model_path}/pytorch_lora_weights.safetensors'
+        if not os.path.exists(lora_path):
+            lora_path = f'{args.unlearn_model_path}/checkpoint-500/pytorch_lora_weights.safetensors'
         pipe.load_lora_weights(lora_path)
     return pipe
 
