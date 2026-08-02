@@ -46,8 +46,21 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_prompts(path):
-    """Load prompts from CSV or TXT file."""
+def load_prompts(path, exp_type="nudity"):
+    """Load prompts from CSV or TXT file.
+
+    Handles two Ring-A-Bell prompt formats:
+
+    1. Nudity CSV (from Ring-A-Bell/data/Prompts_For_ConceptVector/Nudity_prompt.csv):
+       Columns: case_number, nudity, people, clothes, location, evaluation_seed
+       → Lấy cột 'nudity' (index 1)
+
+    2. Violence CSV (from Ring-A-Bell/data/InvPrompt/Violence/):
+       Columns phụ thuộc vào file, thường 'prompt' hoặc 'text'
+       → Lấy cột 'prompt' hoặc fallback về cột đầu tiên
+
+    3. TXT file: mỗi dòng là một prompt (fallback)
+    """
     prompts = []
     if not os.path.exists(path):
         print(f"ERROR: File not found: {path}")
@@ -56,18 +69,44 @@ def load_prompts(path):
     if path.endswith('.csv'):
         with open(path, 'r') as f:
             reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            print(f"[INFO] CSV columns: {fieldnames}")
+
+            # Xác định cột nào chứa prompt dựa vào header
+            prompt_column = None
+
+            # Ưu tiên: các tên cột phổ biến chứa prompt
+            for col in ['prompt', 'text', 'nudity', 'violence', 'unsafe', 'query']:
+                if col in fieldnames:
+                    prompt_column = col
+                    break
+
+            # Nếu không tìm thấy cột quen thuộc, dùng cột index 1 (bỏ qua cột đầu là số thứ tự)
+            if prompt_column is None and len(fieldnames) >= 2:
+                prompt_column = fieldnames[1]
+                print(f"[WARN] No standard prompt column found. Using column '{prompt_column}' (index 1)")
+
+            # Fallback cuối: cột đầu tiên
+            if prompt_column is None and len(fieldnames) >= 1:
+                prompt_column = fieldnames[0]
+                print(f"[WARN] Using first column '{prompt_column}'")
+
             for row in reader:
                 prompt = ''
-                if 'prompt' in row:
-                    prompt = row['prompt']
+                if prompt_column and prompt_column in row:
+                    prompt = row[prompt_column]
                 elif len(row) > 0:
-                    # Use first column if no 'prompt' column
+                    # Fallback: first column
                     prompt = list(row.values())[0]
                 if prompt and prompt.strip():
                     prompts.append(prompt.strip())
+
+            print(f"[INFO] Loaded {len(prompts)} prompts from column '{prompt_column}'")
     else:
         with open(path, 'r') as f:
             prompts = [line.strip() for line in f if line.strip()]
+        print(f"[INFO] Loaded {len(prompts)} prompts from text file")
+
     return prompts
 
 
@@ -85,7 +124,7 @@ def main():
     # Load Ring-A-Bell prompts
     attack_prompts = []
     if args.ring_a_bell_prompts:
-        attack_prompts = load_prompts(args.ring_a_bell_prompts)
+        attack_prompts = load_prompts(args.ring_a_bell_prompts, args.exp_type)
         if attack_prompts:
             print(f"Loaded {len(attack_prompts)} Ring-A-Bell prompts from {args.ring_a_bell_prompts}")
         else:
@@ -146,7 +185,7 @@ def main():
         try:
             image = pipe(
                 prompt,
-                generator=generator.manual_seed(42),
+                generator=generator.manual_seed(42 + i),
                 num_images_per_prompt=1,
             ).images[0]
             safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in prompt)[:50]
