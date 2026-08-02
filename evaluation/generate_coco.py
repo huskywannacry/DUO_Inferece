@@ -230,6 +230,7 @@ def main():
             images = pipe(
                 batch_prompts,
                 generator=generator.manual_seed(args.seed + i),
+                num_inference_steps=args.num_inference_steps,
                 num_images_per_prompt=1,
             ).images
 
