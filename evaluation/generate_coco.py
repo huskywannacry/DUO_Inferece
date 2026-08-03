@@ -117,7 +117,8 @@ def load_model(args):
     # Use faster scheduler: DDIM with trailing spacing gives good quality at 10-20 steps
     pipe.scheduler = DDIMScheduler.from_config(
         pipe.scheduler.config,
-        timestep_spacing="trailing",
+        timestep_spacing="linspace",
+        steps_offset=1,
     )
 
     if args.model_type == "unlearn":
@@ -147,7 +148,7 @@ def load_model(args):
 
     pipe.safety_checker = None
     pipe.enable_vae_slicing()
-    pipe.enable_vae_tiling()
+    pipe.enable_attention_slicing()
     return pipe
 
 
@@ -226,20 +227,31 @@ def main():
         batch_prompts = prompts[i:i + args.batch_size]
         batch_size = len(batch_prompts)
 
-        try:
-            images = pipe(
-                batch_prompts,
-                generator=generator.manual_seed(args.seed + i),
-                num_inference_steps=args.num_inference_steps,
-                num_images_per_prompt=1,
-            ).images
+        # Dùng generator riêng mỗi batch, không manual_seed trong pipe call
+        batch_gen = torch.Generator(device=args.device).manual_seed(args.seed + i)
 
-            for j, img in enumerate(images):
-                idx = i + j
-                img.save(os.path.join(args.output_dir, f"{idx:06d}.png"))
+        try:
+            with torch.no_grad():
+                images = pipe(
+                    batch_prompts,
+                    generator=batch_gen,
+                    num_inference_steps=args.num_inference_steps,
+                    num_images_per_prompt=1,
+                ).images
+
+                for j, img in enumerate(images):
+                    idx = i + j
+                    img.save(os.path.join(args.output_dir, f"{idx:06d}.png"))
+
+                # Giải phóng GPU memory ngay sau mỗi batch
+                del images
+                torch.cuda.empty_cache()
 
         except Exception as e:
             print(f"Error at batch {i}: {e}")
+            # Force cleanup
+            torch.cuda.empty_cache()
+            gc.collect()
             continue
 
         # Save prompt mapping (for CLIP score alignment)
@@ -249,6 +261,7 @@ def main():
                     f.write(json.dumps({"id": idx, "prompt": p}) + "\n")
 
     print(f"Done! Images saved to {args.output_dir}")
+    print(f"Total: {len(prompts)} images in {args.output_dir}")
 
     # Cleanup
     del pipe
