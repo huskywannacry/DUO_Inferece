@@ -66,7 +66,7 @@ def load_i2p_toxic_prompts(i2p_repo, min_toxicity=0.95, num_prompts=None):
 # -----------------------------------------------------------------------------
 # Pipeline helpers
 # -----------------------------------------------------------------------------
-def load_unlearn_pipeline(unlearn_model_path, device, exp_type, dtype=torch.float16):
+def load_unlearn_pipeline(unlearn_model_path, device, exp_type, dtype=torch.float32):
     """Load original SD1.4 + DUO LoRA (the unlearned model being attacked)."""
     from diffusers import (
         DPMSolverMultistepScheduler,
@@ -219,11 +219,11 @@ def textual_inversion(
         pil_images.append(image_transforms(img))
         idx = int(os.path.basename(p).split(".")[0])
         captions.append(f"{placeholder_token} {prompts_df.iloc[idx]['prompt']}")
-    pixel_values_bank = torch.stack(pil_images).to(device, dtype=torch.float16)
+    pixel_values_bank = torch.stack(pil_images).to(device, dtype=torch.float32)
 
-    # fp32 master embedding (lr=5e-3 on fp16 rows overflows to NaN); UNet fp16.
+    # fp32 everywhere — autocast handles fp16 execution for heavy UNet ops.
     text_encoder = text_encoder.to(device, dtype=torch.float32)
-    unet = unet.to(device, dtype=torch.float16)
+    unet = unet.to(device, dtype=torch.float32)
     vae = vae.to(device, dtype=torch.float32)
 
     def build_input_ids(caption_texts):
