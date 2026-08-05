@@ -49,6 +49,8 @@ def check_nudity_nudenet(image_path):
             "ANUS_EXPOSED",
             "MALE_GENITALIA_EXPOSED",
         ]
+        # In kết quả NudeNet chi tiết để debug
+        print(f"  NudeNet: {[(r['class'], round(r['score'], 3)) for r in result]}")
         for item in result:
             if item["class"] in unsafe_labels and item["score"] > 0.5:
                 return True  # contains nudity → defense FAILED
