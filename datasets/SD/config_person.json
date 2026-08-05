@@ -1,0 +1,9 @@
+{
+  "Obama": {
+    "prompt": [],
+    "base_prompt": [],
+    "images": "unsafe",
+    "base_images": "safe",
+    "_comment": "Filled by generate_person_data.py --write_config. Do not train until prompts are populated and image folders exist."
+  }
+}
