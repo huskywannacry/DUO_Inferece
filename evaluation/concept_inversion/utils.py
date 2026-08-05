@@ -279,6 +279,8 @@ def textual_inversion(
 
         input_ids = build_input_ids([captions[i] for i in idxs])
         embeds = embed_layer(input_ids)
+        noisy_latents = noisy_latents.to(unet.dtype)
+        embeds = embeds.to(unet.dtype)
         noise_pred = unet_forward(noisy_latents, timesteps, embeds)
         loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
