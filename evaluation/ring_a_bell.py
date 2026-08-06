@@ -1,26 +1,32 @@
 """
-Ring-A-Bell evaluation - Black-box red teaming attack.
+Ring-A-Bell evaluation — black-box red teaming (DUO paper §4.1).
 
-Faithfully wraps the Ring-A-Bell repo (chiayi-hsu/Ring-A-Bell) to evaluate
-unlearned SD1.4 LoRA models against the published Ring-A-Bell concept
-vector + discovered inverse prompts.
+Paper protocol (HIGH PRIORITY):
+  - Nudity: **95 pre-trained inverse prompts** provided by Ring-A-Bell authors
+    (HuggingFace: Chia15/RingABell-Nudity — gated; request access).
+  - Violence: **250 pre-trained inverse prompts** shipped in Ring-A-Bell repo
+    (data/InvPrompt/Violence/Violence_eta_5.5_K_77.csv).
+  - Generate 1 image per inverse prompt with the **unlearned** SD1.4 (+ LoRA).
+  - Score with NudeNet (nudity) / GPT-4o (violence) → Defense Success Rate.
 
-Pipeline (paper section 4.1):
-  1. Load Ring-A-Bell concept vector (Nudity or Violence) from
-     <ring_a_bell_repo>/Concept Vectors/{Nudity,Violence}_vector.npy
-  2. Load the precomputed inverse prompts (red-team strings) - either from
-     a CSV the user already ran, or run the genetic algorithm on the fly.
-  3. For each inverse prompt, generate an image with the UNLEARNED pipeline.
-  4. NudeNet rates each image -> DSR.
+DUO does **NOT** re-run the genetic algorithm for the numbers in the paper.
+Re-running GA is optional (`--run_ga`) for research only and is very slow.
 
-Usage:
-    python3 -m evaluation.ring_a_bell \
-        --unlearn_model_path outputs/unlearn/SD-train/dpo/500/Nudity \
-        --exp_type nudity \
-        --output_dir eval_results/ring_a_bell_nudity_b500 \
-        --ring_a_bell_repo /path/to/Ring-A-Bell \
-        --device cuda
+Your clone at ~/Code/Ring-A-Bell HELPS: concept vectors + violence InvPrompts +
+seed CSV for optional GA. It does **not** include the 95 nudity InvPrompts
+(those require HF access).
+
+Usage (paper-faithful nudity):
+    python3 -m evaluation.ring_a_bell \\
+        --unlearn_model_path outputs/unlearn/SD-train/dpo/500/Nudity \\
+        --exp_type nudity \\
+        --ring_a_bell_repo ~/Code/Ring-A-Bell \\
+        --ring_a_bell_prompts /path/to/RingABell-Nudity.csv \\
+        --output_dir eval_results/ring_a_bell_nudity_b500 \\
+        --run_dsr
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
@@ -31,113 +37,156 @@ import random
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
-from diffusers import (
-    DPMSolverMultistepScheduler,
-    StableDiffusionPipeline,
-)
+from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
 from tqdm import tqdm
 
 
+# DUO paper §4.1
+PAPER_NUDITY_N = 95
+PAPER_VIOLENCE_N = 250
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Ring-A-Bell evaluation.")
-    parser.add_argument("--unlearn_model_path", type=str, required=True)
-    parser.add_argument(
+    p = argparse.ArgumentParser(
+        description="Ring-A-Bell eval (DUO paper-faithful by default)."
+    )
+    p.add_argument("--unlearn_model_path", type=str, required=True)
+    p.add_argument(
         "--exp_type", type=str, default="nudity", choices=["nudity", "violence"]
     )
-    parser.add_argument("--output_dir", type=str, default="eval_results/ring_a_bell")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument(
+    p.add_argument("--output_dir", type=str, default="eval_results/ring_a_bell")
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument(
         "--ring_a_bell_repo",
         type=str,
-        default="/home/kientt44/Code/Ring-A-Bell",
-        help="Path to the cloned chiayi-hsu/Ring-A-Bell repository.",
+        default=os.path.expanduser("~/Code/Ring-A-Bell"),
+        help="Clone of chiayi-hsu/Ring-A-Bell (vectors + violence prompts).",
     )
-    parser.add_argument(
+    p.add_argument(
         "--ring_a_bell_prompts",
         type=str,
         default=None,
         help=(
-            "Optional CSV with discovered inverse prompts (must have 'prompt' "
-            "column). Use this to skip the genetic-algorithm search. For "
-            "Violence, the repo ships Violence_eta_5.5_K_77.csv. For Nudity "
-            "the prompts must be requested from HuggingFace "
-            "Chia15/RingABell-Nudity."
+            "CSV of inverse prompts (column 'prompt'). "
+            "Nudity: download Chia15/RingABell-Nudity after HF access. "
+            "Violence: defaults to repo Violence_eta_5.5_K_77.csv."
         ),
     )
-    parser.add_argument(
+    p.add_argument(
         "--num_prompts",
         type=int,
         default=None,
-        help="Limit number of inverse prompts to use.",
+        help="Cap prompts (paper: 95 nudity / 250 violence). Default = paper count.",
     )
-    parser.add_argument(
+    p.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=25,
+        help="SD sampling steps for attack images.",
+    )
+    p.add_argument("--guidance_scale", type=float, default=7.5)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--run_dsr",
+        action="store_true",
+        help="After generation, run defense_success_rate (NudeNet / GPT-4o).",
+    )
+    p.add_argument("--openai_api_key", type=str, default=None)
+
+    # Optional GA (NOT used in DUO paper tables)
+    p.add_argument(
+        "--run_ga",
+        action="store_true",
+        help="Re-discover inverse prompts with GA (slow; not DUO paper protocol).",
+    )
+    p.add_argument(
         "--cof",
         type=float,
         default=3.0,
-        help="cof multiplier when running the genetic algorithm on the fly.",
+        help="η / cof in Ring-A-Bell notebook (nudity default 3).",
     )
-    parser.add_argument(
-        "--ga_length",
-        type=int,
-        default=16,
-        help="Token length when running the genetic algorithm (paper uses 16).",
-    )
-    parser.add_argument(
-        "--ga_population",
-        type=int,
-        default=200,
-        help="GA population size.",
-    )
-    parser.add_argument(
-        "--ga_generations",
-        type=int,
-        default=3000,
-        help="GA generation count.",
-    )
-    parser.add_argument(
+    p.add_argument("--ga_length", type=int, default=16, help="K-related length (16).")
+    p.add_argument("--ga_population", type=int, default=200)
+    p.add_argument("--ga_generations", type=int, default=3000)
+    p.add_argument(
         "--seed_prompts_csv",
         type=str,
         default=None,
-        help="Path to unsafe-prompts4703.csv (used as seed pool for GA).",
+        help="unsafe-prompts4703.csv (default: <repo>/data/unsafe-prompts4703.csv).",
     )
-    return parser.parse_args()
+    return p.parse_args()
 
 
-def load_ring_a_bell_vector(repo_path, exp_type, device):
-    """Load the precomputed {Nudity,Violence}_vector.npy from Ring-A-Bell."""
+def paper_num_prompts(exp_type: str) -> int:
+    return PAPER_NUDITY_N if exp_type == "nudity" else PAPER_VIOLENCE_N
+
+
+def resolve_default_prompts_csv(repo: str, exp_type: str) -> str | None:
+    """Return a local CSV path if present (violence shipped; nudity usually not)."""
+    if exp_type == "violence":
+        cand = os.path.join(
+            repo,
+            "data",
+            "InvPrompt",
+            "Violence",
+            "Violence_eta_5.5_K_77.csv",
+        )
+        return cand if os.path.exists(cand) else None
+
+    # Common places users put the HF nudity file after download
+    candidates = [
+        os.path.join(repo, "data", "InvPrompt", "Nudity", "Nudity_prompts.csv"),
+        os.path.join(repo, "data", "InvPrompt", "Nudity", "RingABell-Nudity.csv"),
+        os.path.join(repo, "data", "InvPrompt", "Nudity.csv"),
+        os.path.expanduser("~/Code/RingABell-Nudity.csv"),
+        os.path.expanduser("~/Code/Ring-A-Bell-Nudity.csv"),
+        "/kaggle/input/ringabell-nudity/RingABell-Nudity.csv",
+        "/kaggle/input/ringabell-nudity/nudity_prompts.csv",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def load_inverse_prompts(csv_path: str, num_prompts: int | None) -> list[str]:
+    prompts = []
+    with open(csv_path, "r", newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+        # prefer 'prompt', else first text-like column
+        col = "prompt" if "prompt" in fields else (fields[0] if fields else None)
+        if col is None:
+            raise ValueError(f"Empty CSV: {csv_path}")
+        for row in reader:
+            p = (row.get(col) or "").strip()
+            if p:
+                prompts.append(p)
+    if not prompts:
+        # maybe no header
+        with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line and line.lower() != "prompt":
+                    prompts.append(line.split(",")[0].strip('"'))
+    if num_prompts is not None:
+        prompts = prompts[:num_prompts]
+    return prompts
+
+
+def load_ring_a_bell_vector(repo_path: str, exp_type: str, device: str):
+    import numpy as np
+
     name = "Nudity" if exp_type == "nudity" else "Violence"
     vec_path = os.path.join(repo_path, "Concept Vectors", f"{name}_vector.npy")
     if not os.path.exists(vec_path):
         raise FileNotFoundError(
-            f"Ring-A-Bell concept vector not found: {vec_path}\n"
-            f"Run Get_Concept_Vector.ipynb in the cloned repo first."
+            f"Concept vector missing: {vec_path}\n"
+            "Your Ring-A-Bell clone should include Concept Vectors/*.npy"
         )
     vec = np.load(vec_path)
-    return torch.from_numpy(vec).to(device)
-
-
-def load_existing_inverse_prompts(csv_path, num_prompts=None):
-    """Read precomputed inverse prompts from a CSV."""
-    prompts = []
-    with open(csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames or []
-        col = (
-            "prompt"
-            if "prompt" in fieldnames
-            else (fieldnames[0] if fieldnames else None)
-        )
-        if col is None:
-            raise ValueError(f"No columns found in {csv_path}")
-        for row in reader:
-            p = row.get(col, "").strip()
-            if p:
-                prompts.append(p)
-    if num_prompts:
-        prompts = prompts[:num_prompts]
-    return prompts
+    return torch.from_numpy(vec).to(device=device, dtype=torch.float32)
 
 
 def run_genetic_algorithm(
@@ -150,33 +199,22 @@ def run_genetic_algorithm(
     csv_path,
     exp_type,
     seed_prompts_csv=None,
-    tokenizer=None,
-    text_encoder=None,
     target_vec=None,
-    seed_threshold=0.5,
 ):
-    """Re-implementation of the genetic algorithm in InversePrompt.ipynb.
+    """Optional GA re-discovery. Thresholds match InversePrompt.ipynb (0–100 %).
 
-    Mirrors the notebook exactly:
-      - pool of seed prompts from unsafe-prompts4703.csv, filtered by
-        concept (nudity_percentage > 0.5 OR nudity_percentage<0.5 +
-        inappropriate_percentage>0.5 for violence)
-      - targetEmbed = phi(prompt) + cof * concept_vec
-      - population of random token IDs, fitness = ||targetEmbed - emb||^2
-      - select top half, crossover at random token index, mutate single
-        token with prob 0.25
-      - stop after `generations` iterations, dump top-1 to CSV
+    DUO paper evaluation does NOT use this path for reported tables.
     """
+    import numpy as np
+    import pandas as pd
     from transformers import CLIPTextModel, CLIPTokenizer
 
-    if tokenizer is None or text_encoder is None:
-        tokenizer = CLIPTokenizer.from_pretrained(
-            "CompVis/stable-diffusion-v1-4", subfolder="tokenizer"
-        )
-        text_encoder = CLIPTextModel.from_pretrained(
-            "CompVis/stable-diffusion-v1-4", subfolder="text_encoder"
-        ).to(device)
-    text_encoder = text_encoder.to(device)
+    tokenizer = CLIPTokenizer.from_pretrained(
+        "CompVis/stable-diffusion-v1-4", subfolder="tokenizer"
+    )
+    text_encoder = CLIPTextModel.from_pretrained(
+        "CompVis/stable-diffusion-v1-4", subfolder="text_encoder"
+    ).to(device)
     text_encoder.eval()
 
     if not seed_prompts_csv:
@@ -186,23 +224,25 @@ def run_genetic_algorithm(
     if not os.path.exists(seed_prompts_csv):
         raise FileNotFoundError(seed_prompts_csv)
 
-    df_local = __import__("pandas").read_csv(seed_prompts_csv)
+    df = pd.read_csv(seed_prompts_csv)
     rows = []
+    # CRITICAL: CSV stores percentages in [0, 100], notebook uses >50 / <50
+    # (older DUO wrapper wrongly used 0.5 → ~854 nudity seeds instead of 95)
     if exp_type == "nudity":
-        for _, row in df_local.iterrows():
+        for _, row in df.iterrows():
             try:
-                if float(row.nudity_percentage) > seed_threshold:
+                if float(row.nudity_percentage) > 50:
                     rows.append(row)
             except Exception:
                 continue
     else:
-        for _, row in df_local.iterrows():
+        for _, row in df.iterrows():
             try:
                 cats = str(row.categories).split(",")
                 if (
                     "violence" in cats
-                    and float(row.nudity_percentage) < seed_threshold
-                    and float(row.inappropriate_percentage) > seed_threshold
+                    and float(row.nudity_percentage) < 50
+                    and float(row.inappropriate_percentage) > 50
                     and int(row.hard) == 1
                 ):
                     rows.append(row)
@@ -210,11 +250,21 @@ def run_genetic_algorithm(
                 continue
 
     print(
-        f"[Ring-A-Bell] GA seed pool size: {len(rows)} for exp_type={exp_type}"
+        f"[Ring-A-Bell GA] seed pool={len(rows)} "
+        f"(expect ~95 nudity / ~250 violence if thresholds correct)"
     )
+    if exp_type == "nudity" and abs(len(rows) - PAPER_NUDITY_N) > 5:
+        print(
+            f"WARNING: expected ~{PAPER_NUDITY_N} nudity seeds, got {len(rows)}. "
+            "Check nudity_percentage scale (should be 0–100)."
+        )
+    if exp_type == "violence" and abs(len(rows) - PAPER_VIOLENCE_N) > 5:
+        print(
+            f"WARNING: expected ~{PAPER_VIOLENCE_N} violence seeds, got {len(rows)}."
+        )
 
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    out = open(csv_path, "w", newline="")
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)) or ".", exist_ok=True)
+    out = open(csv_path, "w", newline="", encoding="utf-8")
     writer = csv.writer(out)
     writer.writerow(["prompt", "case_number", "evaluation_seed"])
 
@@ -222,12 +272,12 @@ def run_genetic_algorithm(
     np.random.seed(42)
     torch.manual_seed(42)
 
-    def fitness(population):
+    def fitness(population, target_embed):
         dummy_tokens = torch.cat(population, 0)
         with torch.no_grad():
             dummy_embed = text_encoder(dummy_tokens.to(device))[0]
-            losses = ((targetEmbed - dummy_embed) ** 2).sum(dim=(1, 2))
-        return losses.cpu().detach().numpy()
+            losses = ((target_embed - dummy_embed) ** 2).sum(dim=(1, 2))
+        return losses.cpu().numpy()
 
     def crossover(parents, crossover_rate):
         new_population = []
@@ -237,14 +287,10 @@ def run_genetic_algorithm(
                 idx = np.random.randint(0, len(parents))
                 cp = np.random.randint(1, length + 1)
                 new_population.append(
-                    torch.concat(
-                        (parents[i][:, :cp], parents[idx][:, cp:]), 1
-                    )
+                    torch.concat((parents[i][:, :cp], parents[idx][:, cp:]), 1)
                 )
                 new_population.append(
-                    torch.concat(
-                        (parents[idx][:, :cp], parents[i][:, cp:]), 1
-                    )
+                    torch.concat((parents[idx][:, :cp], parents[i][:, cp:]), 1)
                 )
         return new_population
 
@@ -256,7 +302,7 @@ def run_genetic_algorithm(
                 population[i][:, idx] = val
         return population
 
-    for case_no, row in enumerate(rows):
+    for case_no, row in enumerate(tqdm(rows, desc="GA cases")):
         prompt = row.prompt
         text_input = tokenizer(
             prompt,
@@ -266,11 +312,11 @@ def run_genetic_algorithm(
             return_tensors="pt",
         )
         with torch.no_grad():
-            targetEmbed = (
+            target_embed = (
                 text_encoder(text_input.input_ids.to(device))[0]
                 + cof * target_vec
             )
-        targetEmbed = targetEmbed.detach().clone()
+        target_embed = target_embed.detach().clone()
 
         population = [
             torch.concat(
@@ -287,16 +333,14 @@ def run_genetic_algorithm(
         ]
 
         for step in range(generations):
-            score = fitness(population)
+            score = fitness(population, target_embed)
             idx = np.argsort(score)
             population = [population[i] for i in idx][: population_size // 2]
             if step != generations - 1:
-                new_popu = crossover(population, 0.5)
-                population = mutation(new_popu, 0.25)
+                population = mutation(crossover(population, 0.5), 0.25)
             if step % 500 == 0:
                 print(
-                    f"[Ring-A-Bell] exp={exp_type} cof={cof} length={length} "
-                    f"iter={step} min_loss={score[idx[0]]:.3f}"
+                    f"  case={case_no} step={step} min_loss={score[idx[0]]:.3f}"
                 )
 
         inv = tokenizer.decode(population[0][0][1 : length + 1])
@@ -306,9 +350,30 @@ def run_genetic_algorithm(
     return csv_path
 
 
+def find_lora_path(unlearn_model_path: str, exp_type: str):
+    if exp_type == "violence":
+        return None  # multi-adapter handled in load_lora
+    for cand in (
+        os.path.join(unlearn_model_path, "pytorch_lora_weights.safetensors"),
+        os.path.join(
+            unlearn_model_path, "checkpoint-1000", "pytorch_lora_weights.safetensors"
+        ),
+        os.path.join(
+            unlearn_model_path, "checkpoint-500", "pytorch_lora_weights.safetensors"
+        ),
+        os.path.join(
+            unlearn_model_path, "checkpoint-250", "pytorch_lora_weights.safetensors"
+        ),
+    ):
+        if os.path.exists(cand):
+            return cand
+    raise FileNotFoundError(f"LoRA not found under {unlearn_model_path}")
+
+
 def load_lora(pipe, args):
     if args.exp_type == "violence":
         config_list = ["Blood", "Gun", "Horror", "Suffer"]
+        loaded = []
         for cfg in config_list:
             for cand in (
                 f"{args.unlearn_model_path}/{cfg}/pytorch_lora_weights.safetensors",
@@ -317,144 +382,204 @@ def load_lora(pipe, args):
             ):
                 if os.path.exists(cand):
                     pipe.load_lora_weights(cand, adapter_name=cfg)
+                    loaded.append(cfg)
                     break
+        if len(loaded) != 4:
+            raise FileNotFoundError(
+                f"Violence needs 4 LoRAs {config_list}, found {loaded} under "
+                f"{args.unlearn_model_path}"
+            )
         pipe.set_adapters(config_list, adapter_weights=[1, 1, 1, 1])
     else:
-        lora_path = f"{args.unlearn_model_path}/pytorch_lora_weights.safetensors"
-        if not os.path.exists(lora_path):
-            lora_path = f"{args.unlearn_model_path}/checkpoint-500/pytorch_lora_weights.safetensors"
-        if not os.path.exists(lora_path):
-            lora_path = f"{args.unlearn_model_path}/checkpoint-1000/pytorch_lora_weights.safetensors"
-        if os.path.exists(lora_path):
-            pipe.load_lora_weights(lora_path)
-        else:
-            raise FileNotFoundError(
-                f"LoRA not found in {args.unlearn_model_path}"
-            )
+        lora_path = find_lora_path(args.unlearn_model_path, args.exp_type)
+        print(f"  LoRA: {lora_path}")
+        pipe.load_lora_weights(lora_path)
+
+
+def resolve_prompts_csv(args) -> str:
+    """Paper path: precomputed inverse prompts only (unless --run_ga)."""
+    if args.ring_a_bell_prompts:
+        if not os.path.exists(args.ring_a_bell_prompts):
+            raise FileNotFoundError(args.ring_a_bell_prompts)
+        return args.ring_a_bell_prompts
+
+    default = resolve_default_prompts_csv(args.ring_a_bell_repo, args.exp_type)
+    if default:
+        return default
+
+    if args.run_ga:
+        out_csv = os.path.join(
+            args.output_dir,
+            f"InvPrompt_{args.exp_type}_cof{args.cof}_len{args.ga_length}.csv",
+        )
+        print(
+            "WARNING: --run_ga is NOT the DUO paper evaluation protocol "
+            "(paper uses author-provided pre-trained prompts)."
+        )
+        if not os.path.exists(args.ring_a_bell_repo):
+            raise FileNotFoundError(args.ring_a_bell_repo)
+        target_vec = load_ring_a_bell_vector(
+            args.ring_a_bell_repo, args.exp_type, args.device
+        )
+        run_genetic_algorithm(
+            ring_a_bell_repo=args.ring_a_bell_repo,
+            device=args.device,
+            cof=args.cof,
+            length=args.ga_length,
+            population_size=args.ga_population,
+            generations=args.ga_generations,
+            csv_path=out_csv,
+            exp_type=args.exp_type,
+            seed_prompts_csv=args.seed_prompts_csv,
+            target_vec=target_vec,
+        )
+        return out_csv
+
+    # Paper-faithful failure with clear instructions
+    if args.exp_type == "nudity":
+        raise FileNotFoundError(
+            "\n"
+            "=" * 60 + "\n"
+            "DUO paper needs 95 **pre-trained** Ring-A-Bell nudity InvPrompts.\n"
+            "They are NOT in chiayi-hsu/Ring-A-Bell (gated HF dataset).\n\n"
+            "Steps:\n"
+            "  1. Request access: https://huggingface.co/datasets/Chia15/RingABell-Nudity\n"
+            "  2. Download the CSV of inverse prompts\n"
+            "  3. Re-run with:\n"
+            "       --ring_a_bell_prompts /path/to/nudity_inv_prompts.csv\n\n"
+            "Do NOT use --run_ga for paper numbers (slow + not the provided prompts).\n"
+            "Your clone ~/Code/Ring-A-Bell still helps for concept vectors / violence.\n"
+            + "=" * 60
+        )
+    raise FileNotFoundError(
+        "Violence InvPrompts not found. Expected:\n"
+        f"  {args.ring_a_bell_repo}/data/InvPrompt/Violence/Violence_eta_5.5_K_77.csv\n"
+        "Re-clone https://github.com/chiayi-hsu/Ring-A-Bell"
+    )
 
 
 def main():
     args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    n_cap = args.num_prompts if args.num_prompts is not None else paper_num_prompts(
+        args.exp_type
+    )
 
     print("=" * 60)
-    print("Ring-A-Bell Evaluation (faithful wrapper for chiayi-hsu repo)")
+    print("Ring-A-Bell — DUO paper protocol")
     print("=" * 60)
-    print(f"Unlearned model : {args.unlearn_model_path}")
-    print(f"Task            : {args.exp_type}")
-    print(f"Repo path       : {args.ring_a_bell_repo}")
-    print(f"Output          : {args.output_dir}")
+    print(f"  unlearn model : {args.unlearn_model_path}")
+    print(f"  exp_type      : {args.exp_type}")
+    print(f"  ring-a-bell   : {args.ring_a_bell_repo}")
+    print(f"  paper N       : {paper_num_prompts(args.exp_type)} (using cap={n_cap})")
+    print(f"  run_ga        : {args.run_ga} (paper tables use False)")
+    print(f"  output        : {args.output_dir}")
     print()
 
-    if not os.path.exists(args.ring_a_bell_repo):
-        raise FileNotFoundError(
-            f"Ring-A-Bell repo not found at {args.ring_a_bell_repo}. "
-            f"git clone https://github.com/chiayi-hsu/Ring-A-Bell.git"
-        )
-
-    # 1. Load concept vector from Ring-A-Bell repo
-    device = args.device
-    print("Step 1: Loading Ring-A-Bell concept vector...")
-    target_vec = load_ring_a_bell_vector(args.ring_a_bell_repo, args.exp_type, device)
-    print(f"  vector shape: {tuple(target_vec.shape)}")
-
-    # 2. Resolve inverse prompts
-    inv_prompts_csv = args.ring_a_bell_prompts
-    if inv_prompts_csv is None:
-        # check repo's shipped violence CSVs
-        default_violence = os.path.join(
-            args.ring_a_bell_repo,
-            "data",
-            "InvPrompt",
-            "Violence",
-            "Violence_eta_5.5_K_77.csv",
-        )
-        if args.exp_type == "violence" and os.path.exists(default_violence):
-            inv_prompts_csv = default_violence
-            print(
-                f"Step 2: Using shipped Violence inverse prompts: {inv_prompts_csv}"
-            )
-        else:
-            inv_prompts_csv = os.path.join(
-                args.output_dir,
-                f"InvPrompt_{args.exp_type}_cof{args.cof}_len{args.ga_length}.csv",
-            )
-            print(
-                f"Step 2: Running genetic algorithm -> {inv_prompts_csv} "
-                f"(this is SLOW)"
-            )
-            run_genetic_algorithm(
-                ring_a_bell_repo=args.ring_a_bell_repo,
-                device=device,
-                cof=args.cof,
-                length=args.ga_length,
-                population_size=args.ga_population,
-                generations=args.ga_generations,
-                csv_path=inv_prompts_csv,
-                exp_type=args.exp_type,
-                seed_prompts_csv=args.seed_prompts_csv,
-                target_vec=target_vec,
-            )
-
-    inverse_prompts = load_existing_inverse_prompts(
-        inv_prompts_csv, num_prompts=args.num_prompts
-    )
+    # 1) Inverse prompts (paper: author-provided)
+    prompts_csv = resolve_prompts_csv(args)
+    inverse_prompts = load_inverse_prompts(prompts_csv, num_prompts=n_cap)
     if not inverse_prompts:
-        raise RuntimeError(
-            f"No inverse prompts loaded from {inv_prompts_csv}"
+        raise RuntimeError(f"No prompts in {prompts_csv}")
+    print(f"Loaded {len(inverse_prompts)} inverse prompts from:\n  {prompts_csv}")
+    if args.exp_type == "nudity" and len(inverse_prompts) < PAPER_NUDITY_N:
+        print(
+            f"WARNING: paper uses {PAPER_NUDITY_N} nudity prompts; "
+            f"you have {len(inverse_prompts)}."
         )
-    print(
-        f"Loaded {len(inverse_prompts)} inverse prompts from "
-        f"{inv_prompts_csv}"
-    )
+    if args.exp_type == "violence" and len(inverse_prompts) < PAPER_VIOLENCE_N:
+        print(
+            f"WARNING: paper uses {PAPER_VIOLENCE_N} violence prompts; "
+            f"you have {len(inverse_prompts)}."
+        )
 
-    # 3. Load model + LoRA
-    print("Step 3: Loading unlearned SD1.4 + LoRA...")
+    # 2) Unlearned SD1.4 + LoRA
+    print("Loading SD1.4 + unlearn LoRA...")
     pipe = StableDiffusionPipeline.from_pretrained(
-        "CompVis/stable-diffusion-v1-4", torch_dtype=torch.float16
-    ).to(device)
+        "CompVis/stable-diffusion-v1-4",
+        torch_dtype=torch.float16,
+        safety_checker=None,
+    ).to(args.device)
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe.safety_checker = None
     load_lora(pipe, args)
     pipe.enable_vae_slicing()
     pipe.enable_vae_tiling()
+    pipe.set_progress_bar_config(disable=True)
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    print("Step 4: Generating images with inverse prompts...")
-
+    # 3) Generate
+    print(
+        f"Generating {len(inverse_prompts)} images "
+        f"(steps={args.num_inference_steps}, cfg={args.guidance_scale})..."
+    )
     results = []
-    generator = torch.Generator(device=device)
-    for i, prompt in enumerate(tqdm(inverse_prompts)):
+    gen = torch.Generator(device=args.device)
+    for i, prompt in enumerate(tqdm(inverse_prompts, desc="Ring-A-Bell gen")):
+        out_path = os.path.join(args.output_dir, f"{i:03d}.png")
+        if os.path.exists(out_path):
+            results.append({"id": i, "prompt": prompt, "status": "exists", "file": f"{i:03d}.png"})
+            continue
         try:
             image = pipe(
                 prompt,
-                generator=generator.manual_seed(42 + i),
-                num_images_per_prompt=1,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                generator=gen.manual_seed(args.seed + i),
             ).images[0]
-            safe_name = "".join(
-                c if c.isalnum() or c in " _-" else "_" for c in prompt
-            )[:50]
-            image.save(os.path.join(args.output_dir, f"{i:03d}_{safe_name}.png"))
-            results.append({"id": i, "prompt": prompt, "status": "generated"})
+            image.save(out_path)
+            results.append(
+                {"id": i, "prompt": prompt, "status": "generated", "file": f"{i:03d}.png"}
+            )
         except Exception as e:
-            print(f"Error at prompt {i}: {e}")
-            results.append({"id": i, "prompt": prompt, "status": "error", "error": str(e)})
+            print(f"Error prompt {i}: {e}")
+            results.append(
+                {"id": i, "prompt": prompt, "status": "error", "error": str(e)}
+            )
 
-    with open(
-        os.path.join(args.output_dir, "ring_a_bell_prompts.json"), "w"
-    ) as f:
-        json.dump(results, f, indent=2)
-
-    print(
-        f"\n[Ring-A-Bell] {len(results)} images saved to {args.output_dir}"
-    )
-    print(
-        f"Next: run  python3 -m evaluation.defense_success_rate "
-        f"--task {args.exp_type} --image_dir {args.output_dir}"
-    )
+    meta_path = os.path.join(args.output_dir, "ring_a_bell_prompts.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "protocol": "DUO paper §4.1 Ring-A-Bell",
+                "exp_type": args.exp_type,
+                "prompts_csv": prompts_csv,
+                "num_prompts": len(inverse_prompts),
+                "unlearn_model_path": args.unlearn_model_path,
+                "results": results,
+            },
+            f,
+            indent=2,
+        )
+    print(f"Saved meta → {meta_path}")
+    print(f"Images → {args.output_dir}")
 
     del pipe
     torch.cuda.empty_cache()
     gc.collect()
+
+    # 4) Optional DSR
+    if args.run_dsr:
+        print("Running defense_success_rate...")
+        from evaluation.defense_success_rate import main as dsr_main
+
+        # reuse CLI entry by setting sys.argv
+        sys.argv = [
+            "defense_success_rate",
+            "--task",
+            args.exp_type,
+            "--image_dir",
+            args.output_dir,
+        ]
+        if args.openai_api_key:
+            sys.argv += ["--openai_api_key", args.openai_api_key]
+        dsr_main()
+    else:
+        print(
+            "Next (DSR):\n"
+            f"  python3 -m evaluation.defense_success_rate "
+            f"--task {args.exp_type} --image_dir {args.output_dir}"
+        )
 
 
 if __name__ == "__main__":
