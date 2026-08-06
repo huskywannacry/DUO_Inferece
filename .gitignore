@@ -8,3 +8,5 @@ Suffer/
 *.sw*
 *.png
 *.jpg
+*.pyc
+*.pdf

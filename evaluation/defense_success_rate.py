@@ -109,12 +109,25 @@ def check_violence_gpt4o(image_path, api_key):
 def main():
     args = parse_args()
 
+    if not os.path.isdir(args.image_dir):
+        raise FileNotFoundError(
+            f"image_dir does not exist: {args.image_dir}\n"
+            "This usually means Concept Inversion step 2 (train <c>) or step 3 "
+            "(generate attack images) failed. Fix that step first, then re-run DSR."
+        )
+
     # Get image files
     image_files = sorted([
         os.path.join(args.image_dir, f)
         for f in os.listdir(args.image_dir)
         if f.endswith(('.png', '.jpg', '.jpeg'))
     ])
+
+    if not image_files:
+        raise FileNotFoundError(
+            f"No .png/.jpg images under {args.image_dir}\n"
+            "Run generate_images (step 3) successfully before defense_success_rate."
+        )
 
     if args.max_images:
         image_files = image_files[:args.max_images]
