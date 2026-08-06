@@ -1,54 +1,58 @@
 #!/usr/bin/env bash
-# FIXED_IDEA end-to-end MVP orchestrator (data -> pilot -> train both methods -> eval).
+# FIXED_IDEA orchestrator — supports one or many people.
 #
-# Usage (repo root, GPU):
+# Usage:
 #   bash scripts/run-mvp.sh
-#   STAGE=data bash scripts/run-mvp.sh          # only gen + pilot
-#   STAGE=train bash scripts/run-mvp.sh         # only train (data must exist)
-#   STAGE=eval bash scripts/run-mvp.sh          # only eval both concepts
-#   NUM_IMAGES=50 MAX_STEPS=500 bash scripts/run-mvp.sh   # pilot mini
+#   PERSONS="obama" STAGE=data bash scripts/run-mvp.sh
+#   PERSONS="obama,elon,trump" STAGE=train NUM_IMAGES=50 BETAS=500 bash scripts/run-mvp.sh
 
 set -euo pipefail
 
 STAGE=${STAGE:-"all"}
-NUM_IMAGES=${NUM_IMAGES:-64}
+NUM_IMAGES=${NUM_IMAGES:-50}
 METHODS=${METHODS:-"sdedit,face_inpaint"}
 BETAS=${BETAS:-"500"}
 MAX_STEPS=${MAX_STEPS:-1000}
-PERSON=${PERSON:-"Barack Obama"}
+PERSONS=${PERSONS:-"obama"}   # default 1 person for 12h; multi: obama,elon,trump
 DEVICE=${DEVICE:-"cuda"}
 
 base_dir=$(pwd)
 cd "$base_dir"
 
 run_data() {
-  NUM_IMAGES="$NUM_IMAGES" METHODS="$METHODS" PERSON="$PERSON" DEVICE="$DEVICE" \
-    bash scripts/prepare-person.sh
+  PERSONS="$PERSONS" NUM_IMAGES="$NUM_IMAGES" METHODS="$METHODS" DEVICE="$DEVICE" \
+    bash scripts/prepare-multi-person.sh
 }
 
 run_train() {
-  for concept in Obama_SDEdit Obama_FaceInpaint; do
-    if [[ -d "datasets/person_data/$concept/unsafe" ]]; then
-      CONCEPT="$concept" PERSON="$PERSON" BETAS="$BETAS" MAX_STEPS="$MAX_STEPS" \
-        NUM_SAMPLES="$NUM_IMAGES" bash scripts/sd-person.sh
-    else
-      echo "SKIP train $concept (missing data)"
-    fi
-  done
+  PERSONS="$PERSONS" BETAS="$BETAS" MAX_STEPS="$MAX_STEPS" NUM_SAMPLES="$NUM_IMAGES" \
+    bash scripts/train-multi-person.sh
 }
 
 run_eval() {
-  for concept in Obama_SDEdit Obama_FaceInpaint; do
-    for beta in $BETAS; do
-      path="outputs/unlearn/SD-train/dpo/$beta/$concept"
-      if [[ -d "$path" ]]; then
-        UNLEARN_MODEL_PATH="$path" \
-          OUTPUT_DIR="eval_results/${concept}_b${beta}" \
-          PERSON="$PERSON" DEVICE="$DEVICE" \
-          bash scripts/eval-person.sh
-      else
-        echo "SKIP eval $path"
-      fi
+  declare -A PERSON_NAME PREFIX_MAP
+  PERSON_NAME[obama]="Barack Obama"; PREFIX_MAP[obama]="Obama"
+  PERSON_NAME[elon]="Elon Musk";     PREFIX_MAP[elon]="Musk"
+  PERSON_NAME[trump]="Donald Trump"; PREFIX_MAP[trump]="Trump"
+
+  IFS=',' read -ra KEYS <<< "$PERSONS"
+  for key in "${KEYS[@]}"; do
+    key=$(echo "$key" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+    prefix="${PREFIX_MAP[$key]:-}"
+    person="${PERSON_NAME[$key]:-}"
+    [[ -z "$prefix" ]] && continue
+    for suffix in SDEdit FaceInpaint; do
+      for beta in $BETAS; do
+        path="outputs/unlearn/SD-train/dpo/$beta/${prefix}_${suffix}"
+        if [[ -d "$path" ]]; then
+          UNLEARN_MODEL_PATH="$path" \
+            OUTPUT_DIR="eval_results/${prefix}_${suffix}_b${beta}" \
+            PERSON="$person" DEVICE="$DEVICE" \
+            bash scripts/eval-person.sh
+        else
+          echo "SKIP eval $path"
+        fi
+      done
     done
   done
 }
@@ -67,4 +71,4 @@ case "$STAGE" in
     ;;
 esac
 
-echo "==> MVP stage=$STAGE done"
+echo "==> MVP stage=$STAGE persons=$PERSONS done"
