@@ -66,8 +66,12 @@ def load_i2p_toxic_prompts(i2p_repo, min_toxicity=0.95, num_prompts=None):
 # -----------------------------------------------------------------------------
 # Pipeline helpers
 # -----------------------------------------------------------------------------
-def load_unlearn_pipeline(unlearn_model_path, device, exp_type, dtype=torch.float32):
-    """Load original SD1.4 + DUO LoRA (the unlearned model being attacked)."""
+def load_unlearn_pipeline(unlearn_model_path, device, exp_type, dtype=torch.float16):
+    """Load original SD1.4 + DUO LoRA (the unlearned model being attacked).
+
+    Default fp16 for attack generation. Textual inversion re-casts to fp32
+    inside `textual_inversion()` (required for PEFT + time_embedding stability).
+    """
     from diffusers import (
         DPMSolverMultistepScheduler,
         StableDiffusionPipeline,
@@ -168,26 +172,7 @@ def textual_inversion(
             f"token id {token_id}; choose a different placeholder."
         )
 
-    # 2. Initialize <c> with the embedding of an existing word
-    init_ids = tokenizer.encode(initializer_token, add_special_tokens=False)
-    init_id = init_ids[0]
-    embed_layer = text_encoder.get_input_embeddings()
-    embed_layer.weight.data[token_id] = embed_layer.weight.data[init_id].clone()
-
-    # 3. Freeze everything; only <c>'s embedding row is trainable
-    for p in text_encoder.parameters():
-        p.requires_grad = False
-    for p in unet.parameters():
-        p.requires_grad = False
-    for p in vae.parameters():
-        p.requires_grad = False
-    embed_layer.weight.requires_grad = True
-
-    optimizer = torch.optim.Adam(
-        [embed_layer.weight], lr=lr, betas=(0.9, 0.999), weight_decay=0.0
-    )
-
-    # 4. Image preprocessing
+    # 2. Image preprocessing + load anchors first (cheap), then cast models
     import torchvision
 
     image_transforms = torchvision.transforms.Compose(
@@ -202,7 +187,6 @@ def textual_inversion(
         ]
     )
 
-    # 5. Load anchor images (filename {i:04d}.png maps to prompts_df.iloc[i])
     image_paths = sorted(
         os.path.join(anchor_dir, f)
         for f in os.listdir(anchor_dir)
@@ -221,10 +205,52 @@ def textual_inversion(
         captions.append(f"{placeholder_token} {prompts_df.iloc[idx]['prompt']}")
     pixel_values_bank = torch.stack(pil_images).to(device, dtype=torch.float32)
 
-    # fp32 everywhere — autocast handles fp16 execution for heavy UNet ops.
-    text_encoder = text_encoder.to(device, dtype=torch.float32)
-    unet = unet.to(device, dtype=torch.float32)
-    vae = vae.to(device, dtype=torch.float32)
+    # -------------------------------------------------------------------------
+    # Pure fp32 TI loop.
+    # Do NOT use autocast/GradScaler: PEFT LoRA loaded under fp16 often leaves
+    # some UNet/time_embedding weights in Half while timestep embeds are Float
+    # → RuntimeError: mat1 Float and mat2 Half (Kaggle T4).
+    # -------------------------------------------------------------------------
+    def _force_float32(module):
+        module.to(device=device, dtype=torch.float32)
+        for p in module.parameters():
+            if p.is_floating_point() and p.dtype != torch.float32:
+                p.data = p.data.float()
+        for b in module.buffers():
+            if b.is_floating_point() and b.dtype != torch.float32:
+                b.data = b.data.float()
+        return module
+
+    text_encoder = _force_float32(text_encoder)
+    unet = _force_float32(unet)
+    vae = _force_float32(vae)
+
+    # 3. Init <c> embedding AFTER fp32 cast (embedding matrix is now fp32)
+    embed_layer = text_encoder.get_input_embeddings()
+    init_ids = tokenizer.encode(initializer_token, add_special_tokens=False)
+    init_id = init_ids[0]
+    with torch.no_grad():
+        embed_layer.weight.data[token_id] = embed_layer.weight.data[init_id].clone()
+
+    # Freeze everything except the embedding table (we mask other rows each step)
+    for p in text_encoder.parameters():
+        p.requires_grad = False
+    for p in unet.parameters():
+        p.requires_grad = False
+    for p in vae.parameters():
+        p.requires_grad = False
+    embed_layer.weight.requires_grad = True
+
+    bad = [
+        (n, p.dtype)
+        for n, p in unet.named_parameters()
+        if p.is_floating_point() and p.dtype != torch.float32
+    ]
+    if bad:
+        raise RuntimeError(
+            f"UNet still has non-fp32 params after cast (e.g. {bad[:3]}). "
+            "TI requires full fp32; check peft/LoRA load."
+        )
 
     def build_input_ids(caption_texts):
         input_ids = tokenizer(
@@ -238,22 +264,16 @@ def textual_inversion(
 
     print(
         f"[textual_inversion] max_steps={max_steps} bs={batch_size} lr={lr} "
-        f"anchors={pixel_values_bank.shape[0]} token_id={token_id}"
+        f"anchors={pixel_values_bank.shape[0]} token_id={token_id} "
+        f"dtype=fp32 (no autocast)"
     )
 
     orig_embeds_params = embed_layer.weight.data.clone()
     losses = []
     rng = np.random.default_rng(42)
-    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        scaler = torch.amp.GradScaler("cuda")
-        @torch.amp.autocast("cuda", dtype=torch.float16)
-        def unet_forward(noisy_latents, timesteps, embeds):
-            return unet(noisy_latents, timesteps, embeds).sample
-    else:
-        scaler = torch.cuda.amp.GradScaler()
-        @torch.cuda.amp.autocast(dtype=torch.float16)
-        def unet_forward(noisy_latents, timesteps, embeds):
-            return unet(noisy_latents, timesteps, embeds).sample
+    optimizer = torch.optim.Adam(
+        [embed_layer.weight], lr=lr, betas=(0.9, 0.999), weight_decay=0.0
+    )
 
     for step in range(max_steps):
         idxs = rng.choice(
@@ -265,9 +285,10 @@ def textual_inversion(
 
         with torch.no_grad():
             latents = (
-                vae.encode(batch_pixels.to(torch.float32)).latent_dist.sample()
+                vae.encode(batch_pixels.float()).latent_dist.sample()
                 * vae.config.scaling_factor
             )
+            latents = latents.float()
             noise = torch.randn_like(latents)
             timesteps = torch.randint(
                 0,
@@ -275,13 +296,18 @@ def textual_inversion(
                 (latents.shape[0],),
                 device=device,
             ).long()
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps).float()
 
         input_ids = build_input_ids([captions[i] for i in idxs])
-        embeds = embed_layer(input_ids)
-        noisy_latents = noisy_latents.to(unet.dtype)
-        embeds = embeds.to(unet.dtype)
-        noise_pred = unet_forward(noisy_latents, timesteps, embeds)
+        # Keep embedding row in fp32 for stable TI grads
+        embeds = embed_layer(input_ids).float()
+
+        # Explicit encoder_hidden_states kwarg (diffusers UNet API)
+        noise_pred = unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=embeds,
+        ).sample
         loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
         if not torch.isfinite(loss):
@@ -289,12 +315,13 @@ def textual_inversion(
                 f"[textual_inversion] WARNING: NaN loss at step {step+1} "
                 f"(noise_pred range = [{noise_pred.min():.3f}, {noise_pred.max():.3f}])"
             )
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
-        scaler.scale(loss).backward()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_([embed_layer.weight], max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
         # Restore every row except <c> (CCE reference safeguard).
         with torch.no_grad():
@@ -306,7 +333,7 @@ def textual_inversion(
                 index_no_updates
             ]
 
-        losses.append(loss.item())
+        losses.append(float(loss.detach().cpu()))
         if (step + 1) % 200 == 0:
             print(
                 f"[textual_inversion] step={step+1}/{max_steps} "
