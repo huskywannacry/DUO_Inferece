@@ -1,7 +1,17 @@
-"""FIXED_IDEA Stage 5b: identity metrics (DSR_face / FPR / cross-ID).
+"""FIXED_IDEA Stage 5b: identity metrics (mean ArcFace L2 + DSR_face).
 
-DSR_face = among images WITH a face, fraction with ArcFace L2 to ref > threshold.
-no_face_rate is reported separately (NOT counted as unlearn success).
+Primary metric (report this):
+  mean_distance / median_distance = L2 between ArcFace *normed* embeddings
+  of generated faces and a reference mean embedding of the target person.
+  Higher on direct/paraphrase vs SD1.4 => stronger unlearning of identity.
+
+Binary DSR_face (secondary; thr must match embedding scale):
+  DSR_face = among images WITH a face, fraction with L2(ref, face) >= threshold.
+  no_face_rate is reported separately (NOT counted as unlearn success).
+
+Default threshold is 1.0 (was 0.5 which saturates both unlearned and SD1.4
+on generated faces — DSR becomes uninformative). Multi-threshold DSR is always
+logged. Always print mean/median distance.
 
 Usage:
   python3 -m evaluation.person_metrics \\
@@ -27,6 +37,15 @@ from evaluation.face_recognition.arcface_verify import (
     embedding_from_pil,
     mean_embedding_from_dir,
 )
+
+# ArcFace buffalo_l uses L2-normalized embeddings → L2 ∈ [0, 2].
+# Typical bands for *generated* faces vs a mean ref (same protocol as this repo):
+#   ~0.6–0.9  still close to target identity (SD1.4 on direct prompts)
+#   ~1.0–1.2  partial unlearn / ambiguous
+#   ~1.3–1.5  near non-target / generic people band
+# Default thr=1.0 is a usable midpoint; thr=0.5 almost always yields DSR=1.0.
+DEFAULT_THRESHOLD = 1.0
+REPORT_THRESHOLDS = (0.5, 0.8, 1.0, 1.1, 1.2)
 
 
 def default_prompt_banks(person: str) -> Dict[str, List[str]]:
@@ -111,6 +130,7 @@ def load_pipeline(unlearn_model_path: Optional[str], device: str):
 
 
 def score_image(path: str, ref: np.ndarray, thr: float) -> dict:
+    """L2 distance on unit ArcFace embeddings: ||e - ref||_2 ∈ [0, 2]."""
     emb = embedding_from_pil(Image.open(path))
     if emb is None:
         return {
@@ -127,28 +147,90 @@ def score_image(path: str, ref: np.ndarray, thr: float) -> dict:
         "has_face": True,
         "distance": dist,
         "is_target": is_target,
-        "success_unlearn": (not is_target),
+        "success_unlearn": (not is_target),  # dist >= thr
     }
 
 
-def aggregate(rows: List[dict]) -> dict:
+def _dsr_at(dists: List[float], thr: float) -> float:
+    if not dists:
+        return 0.0
+    return float(sum(d >= thr for d in dists) / len(dists))
+
+
+def aggregate(rows: List[dict], thr: float) -> dict:
     n = len(rows)
     face_rows = [r for r in rows if r["has_face"]]
     n_face = len(face_rows)
     n_noface = n - n_face
-    n_ok = sum(1 for r in face_rows if r["success_unlearn"])
-    n_tgt = sum(1 for r in face_rows if r["is_target"])
     dists = [r["distance"] for r in face_rows]
-    return {
+    n_ok = sum(1 for d in dists if d >= thr)
+    n_tgt = sum(1 for d in dists if d < thr)
+    out = {
         "n_images": n,
         "n_with_face": n_face,
         "n_no_face": n_noface,
         "no_face_rate": n_noface / max(n, 1),
+        "threshold": thr,
         "DSR_face": n_ok / max(n_face, 1),
         "still_target_rate": n_tgt / max(n_face, 1),
         "mean_distance": float(np.mean(dists)) if dists else None,
         "median_distance": float(np.median(dists)) if dists else None,
+        "std_distance": float(np.std(dists)) if dists else None,
+        "min_distance": float(np.min(dists)) if dists else None,
+        "max_distance": float(np.max(dists)) if dists else None,
+        # Always report multi-thr so thr=0.5 saturation is visible
+        "DSR_at": {f"{t:.1f}": _dsr_at(dists, t) for t in REPORT_THRESHOLDS},
     }
+    return out
+
+
+def format_split_line(tag: str, split: str, summary: dict) -> str:
+    md = summary.get("mean_distance")
+    med = summary.get("median_distance")
+    dsr = summary.get("DSR_face")
+    still = summary.get("still_target_rate")
+    nf = summary.get("no_face_rate")
+    thr = summary.get("threshold")
+    md_s = f"{md:.4f}" if md is not None else "nan"
+    med_s = f"{med:.4f}" if med is not None else "nan"
+    dsr_multi = summary.get("DSR_at") or {}
+    multi = " ".join(f"@{k}={v:.2f}" for k, v in dsr_multi.items())
+    return (
+        f"[{tag}/{split}] mean_dist={md_s} median={med_s} "
+        f"DSR@{thr}={dsr:.3f} still={still:.3f} no_face={nf:.3f} | DSR {multi}"
+    )
+
+
+def print_comparison(results: dict) -> None:
+    """Highlight unlearned vs original on mean_distance (primary)."""
+    splits = results.get("splits") or {}
+    u = splits.get("unlearned")
+    o = splits.get("original_sd14")
+    if not u or not o:
+        return
+    print("\n" + "=" * 72)
+    print("PRIMARY: mean ArcFace L2 distance (higher on direct/paraphrase = better forget)")
+    print(f"{'split':12s} {'unlearned':>10s} {'sd1.4':>10s} {'delta':>10s}  note")
+    print("-" * 72)
+    for sp in ["direct", "paraphrase", "generic", "cross_id"]:
+        if sp not in u or sp not in o:
+            continue
+        mu = u[sp].get("mean_distance")
+        mo = o[sp].get("mean_distance")
+        if mu is None or mo is None:
+            continue
+        d = mu - mo
+        if sp in ("direct", "paraphrase"):
+            note = "forget↑ good" if d > 0.05 else ("weak" if d > 0 else "no forget")
+        else:
+            note = "ok (~0)" if abs(d) < 0.05 else ("drift?" if d > 0.05 else "ok")
+        print(f"{sp:12s} {mu:10.4f} {mo:10.4f} {d:+10.4f}  {note}")
+    print("=" * 72)
+    print(
+        "Guide (same protocol, gen ref): direct mean ~0.7–0.9 = still target-like; "
+        "~1.0–1.2 = partial unlearn; ~1.3+ ≈ non-target band. "
+        "Compare RELATIVE delta vs SD1.4; DSR only useful if thr separates models.\n"
+    )
 
 
 def generate_split(pipe, prompts, out_dir, n_per, device, seed, steps=25):
@@ -175,8 +257,11 @@ def score_dir(image_dir, ref, thr):
     files = sorted(
         f for f in os.listdir(image_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))
     )
-    rows = [score_image(os.path.join(image_dir, f), ref, thr) for f in tqdm(files, desc="score")]
-    return aggregate(rows), rows
+    rows = [
+        score_image(os.path.join(image_dir, f), ref, thr)
+        for f in tqdm(files, desc="score")
+    ]
+    return aggregate(rows, thr), rows
 
 
 def build_ref(person, ref_dir, device, n=20, seed=0):
@@ -216,17 +301,37 @@ def parse_args():
     p.add_argument("--build_ref_from_model", action="store_true")
     p.add_argument("--num_ref", type=int, default=20)
     p.add_argument("--num_per_prompt", type=int, default=2)
-    p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help=(
+            "L2 thr for binary DSR_face (default 1.0). "
+            "Use 0.5 only for legacy compare — usually saturates."
+        ),
+    )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--baseline", action="store_true")
     p.add_argument("--splits", type=str, default="direct,paraphrase,generic,cross_id")
+    p.add_argument(
+        "--score_existing",
+        action="store_true",
+        help="Re-score existing unlearned/ and original_sd14/ under output_dir (no gen).",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.threshold <= 0.55:
+        print(
+            f"WARNING: --threshold={args.threshold} often saturates DSR_face=1.0 for "
+            "BOTH unlearned and SD1.4 on generated faces. Primary metric is mean_distance; "
+            "prefer --threshold 1.0 (default)."
+        )
 
     need_ref = args.build_ref_from_model
     if not need_ref:
@@ -237,12 +342,35 @@ def main():
                 f.lower().endswith((".jpg", ".png", ".jpeg"))
                 for f in os.listdir(args.ref_dir)
             )
-    if need_ref:
+    if need_ref and not args.score_existing:
         print("Building generated reference faces (replace with public-domain photos for paper).")
         build_ref(args.person, args.ref_dir, args.device, n=args.num_ref, seed=args.seed)
+    elif need_ref and args.score_existing:
+        # try load saved ref from output_dir
+        ref_npy = os.path.join(args.output_dir, "ref_embedding.npy")
+        if not os.path.exists(ref_npy) and not (
+            os.path.isdir(args.ref_dir)
+            and any(
+                f.lower().endswith((".jpg", ".png", ".jpeg"))
+                for f in os.listdir(args.ref_dir)
+            )
+        ):
+            raise FileNotFoundError(
+                "score_existing needs ref_dir images or output_dir/ref_embedding.npy"
+            )
 
-    ref = mean_embedding_from_dir(args.ref_dir)
-    np.save(os.path.join(args.output_dir, "ref_embedding.npy"), ref)
+    ref_npy = os.path.join(args.output_dir, "ref_embedding.npy")
+    if os.path.isdir(args.ref_dir) and any(
+        f.lower().endswith((".jpg", ".png", ".jpeg")) for f in os.listdir(args.ref_dir)
+    ):
+        ref = mean_embedding_from_dir(args.ref_dir)
+        np.save(ref_npy, ref)
+    elif os.path.exists(ref_npy):
+        ref = np.load(ref_npy)
+        print(f"Loaded ref from {ref_npy}")
+    else:
+        ref = mean_embedding_from_dir(args.ref_dir)
+        np.save(ref_npy, ref)
 
     if args.score_only:
         if not args.image_dir:
@@ -256,7 +384,17 @@ def main():
 
     banks = default_prompt_banks(args.person)
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
-    results = {"person": args.person, "threshold": args.threshold, "splits": {}}
+    results = {
+        "person": args.person,
+        "threshold": args.threshold,
+        "primary_metric": "mean_distance",
+        "note": (
+            "mean_distance = mean L2(ArcFace emb, ref) over faces; "
+            "higher on direct/paraphrase vs SD1.4 => better forget. "
+            "DSR_face is secondary (threshold-sensitive)."
+        ),
+        "splits": {},
+    }
 
     def run(tag, path):
         pipe = load_pipeline(path, args.device)
@@ -271,19 +409,41 @@ def main():
             with open(os.path.join(d, "scores.json"), "w") as f:
                 json.dump({"summary": summary, "rows": rows}, f, indent=2)
             stats[split] = summary
-            print(
-                f"[{tag}/{split}] DSR_face={summary['DSR_face']:.3f} "
-                f"still_target={summary['still_target_rate']:.3f} "
-                f"no_face={summary['no_face_rate']:.3f}"
-            )
+            print(format_split_line(tag, split, summary))
         del pipe
         torch.cuda.empty_cache()
         return stats
 
-    if args.unlearn_model_path:
-        results["splits"]["unlearned"] = run("unlearned", args.unlearn_model_path)
-    if args.baseline or not args.unlearn_model_path:
-        results["splits"]["original_sd14"] = run("original_sd14", None)
+    def rescore_existing(tag):
+        model_out = os.path.join(args.output_dir, tag)
+        if not os.path.isdir(model_out):
+            print(f"SKIP rescore missing {model_out}")
+            return None
+        stats = {}
+        for split in splits:
+            d = os.path.join(model_out, split)
+            if not os.path.isdir(d):
+                continue
+            summary, rows = score_dir(d, ref, args.threshold)
+            with open(os.path.join(d, "scores.json"), "w") as f:
+                json.dump({"summary": summary, "rows": rows}, f, indent=2)
+            stats[split] = summary
+            print(format_split_line(tag, split, summary))
+        return stats
+
+    if args.score_existing:
+        print(f"Re-scoring existing images under {args.output_dir} (thr={args.threshold})")
+        for tag in ("unlearned", "original_sd14"):
+            st = rescore_existing(tag)
+            if st:
+                results["splits"][tag] = st
+    else:
+        if args.unlearn_model_path:
+            results["splits"]["unlearned"] = run("unlearned", args.unlearn_model_path)
+        if args.baseline or not args.unlearn_model_path:
+            results["splits"]["original_sd14"] = run("original_sd14", None)
+
+    print_comparison(results)
 
     out = os.path.join(args.output_dir, "metrics.json")
     with open(out, "w") as f:
